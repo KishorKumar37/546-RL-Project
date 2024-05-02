@@ -46,11 +46,11 @@ LR_WORKER       = 1e-4
 
 DISCOUNT_FACTOR = 0.99
 
-MAX_EPISODES    = 200
+MAX_EPISODES    = 100
 N_STEP          = 512
 # N_STEP          = 10
 
-GRAD_CLIP       = 50
+GRAD_CLIP       = None
 TERMINATION_REWARD = 200
 REWARD_SCALING  = 1e-11
 RETAIN_GRAPH    = True
@@ -200,6 +200,8 @@ class A3CMaster():
 
         self.episode_rewards = []
         self.episode_losses = []
+        self.episode_steps = []
+        self.episode_targets = []
 
         self.global_queue = mp.Queue()
         self.global_step_counter = mp.Value("i", 0)
@@ -216,25 +218,27 @@ class A3CMaster():
 
         done = 0
         while done < N_WORKERS:
-            r, l = self.global_queue.get()
+            r, l, t, targs = self.global_queue.get()
 
             if r is not None:
                 self.episode_rewards.append(r)
                 self.episode_losses.append(l)
+                self.episode_steps.append(t)
+                self.episode_targets.append(targs)
 
             else:
                 done += 1
             
-            if sum(self.episode_rewards[-100:]) >= 50000:
-                done = N_WORKERS
-                [worker.terminate() for worker in workers]
-                print("Achieved target score, stopping training early")
+            # if sum(self.episode_rewards[-100:]) >= 50000:
+            #     done = N_WORKERS
+            #     [worker.terminate() for worker in workers]
+            #     print("Achieved target score, stopping training early")
                 
         print("Exit Loop")
 
         # [worker.join() for worker in workers]
 
-        return self.episode_rewards, self.episode_losses
+        return self.episode_rewards, self.episode_losses, self.episode_steps, self.episode_targets
         
 class A3CWorker(mp.Process):
 
@@ -309,8 +313,8 @@ class A3CWorker(mp.Process):
                 episode_reward = episode_reward + reward.sum()
 
                 reward *= REWARD_SCALING
-                print(f"Reward: {reward.shape}")
-                print(f"Value: {value_current_state.shape}")
+                # print(f"Reward: {reward.shape}")
+                # print(f"Value: {value_current_state.shape}")
 
                 if done:
                     reward += TERMINATION_REWARD
@@ -339,9 +343,9 @@ class A3CWorker(mp.Process):
                     self.asynchronous_update()
                     start_step = self.step_counter
                 
-            self.global_queue.put((episode_reward, episode_loss))
+            self.global_queue.put((episode_reward, episode_loss, self.env.step_counter, self.env.targets_left))
         
-        self.global_queue.put((None, None))
+        self.global_queue.put((None, None, None, None))
 
     def accumulate_gradients(self,
                              terminated,
@@ -357,11 +361,11 @@ class A3CWorker(mp.Process):
             R = 0
         else:
             _, value_next_state = self.local_model.forward(next_state_1, next_state_2)
-            R = value_next_state.detach()
+            R = value_next_state
         
         for t in reversed(range(self.step_counter - start_step)):
             R *= DISCOUNT_FACTOR
-            print(f"Reward memory: {memory.reward[t].shape}")
+            # print(f"Reward memory: {memory.reward[t].shape}")
             R += memory.reward[t]
 
             advantage = R - memory.value_current_state[t]
@@ -370,7 +374,7 @@ class A3CWorker(mp.Process):
             actor_loss = log_policy*advantage
             critic_loss = 0.5 * torch.square(advantage)
 
-            loss = actor_loss + critic_loss
+            loss = (actor_loss + critic_loss).sum()
             loss.backward(retain_graph=RETAIN_GRAPH)
             update_loss += loss.item()
         
@@ -400,13 +404,17 @@ class A3CWorker(mp.Process):
 
 if __name__ == "__main__":
     trainer = A3CMaster()
-    episode_rewards, episode_losses = trainer.train()
+    episode_rewards, episode_losses, episode_steps, episode_targets = trainer.train()
     torch.save(episode_rewards,
-               "a3c_cartpole_rewards.pkl")
+               "a3c_mas_rewards.pkl")
     torch.save(episode_losses,
-               "a3c_cartpole_losses.pkl")
+               "a3c_mas_losses.pkl")
+    torch.save(episode_steps,
+               "a3c_mas_steps.pkl")
+    torch.save(episode_targets,
+               "a3c_mas_targets.pkl")
     torch.save(trainer.global_model.state_dict(),
-               "kishorku_vveera_assignment3_part1_cartpole.pkl")
+               "a3c_mas_checkpoint.pkl")
 
     if DEVICE == "cuda":
         torch.cuda.empty_cache()
