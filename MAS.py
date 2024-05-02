@@ -9,6 +9,7 @@ import numpy as np
 from collections import deque, namedtuple
 import random
 import argparse
+from MAS_Environment import MAS_env
 # import wandb
 
 parser = argparse.ArgumentParser(description="Hyperparameter parser")
@@ -17,17 +18,22 @@ parser.add_argument("--asynchronous",
                     help="asynchronous")
 args = parser.parse_args()
 
-ENV_NAME        = "Walker2d-v4"
+# ENV_NAME        = "Walker2d-v4"
 
-env = gym.make(ENV_NAME)
+env = MAS_env(grid_size=32,
+              obs_size=5,
+              num_agents=8,
+              num_targets=12)
+
 N_STATES        = env.observation_space.shape[0]
-N_ACTIONS       = env.action_space.shape[0]
+N_ACTIONS       = env.action_space.n
 del env
 
 N_HIDDEN        = 128
 
 if args.asynchronous == "True":
-    N_WORKERS       = mp.cpu_count()
+    # N_WORKERS       = mp.cpu_count()
+    N_WORKERS       = 4
     print(f"Running A3C with {N_WORKERS} workers")
 else:
     N_WORKERS       = 1
@@ -50,7 +56,7 @@ REWARD_SCALING  = 1e-11
 RETAIN_GRAPH    = True
 
 DEVICE          = torch.device("cpu")
-DTYPE           = torch.float64
+DTYPE           = torch.float32
 
 # if args.lr is not None:
 #     LR = args.lr
@@ -61,8 +67,7 @@ DTYPE           = torch.float64
 # print(LR, DISCOUNT_FACTOR)
 
 Transition = namedtuple(typename="Transition",
-                        field_names=("mu", 
-                                     "sigma",
+                        field_names=("policy_distribution",
                                      "action",
                                      "reward",
                                      "value_current_state"))
@@ -117,7 +122,7 @@ class ActorCritic(nn.Module):
         super(ActorCritic, self).__init__()
         
         self.shared_conv = nn.Sequential(
-            nn.Conv2d(in_channels=2,
+            nn.Conv2d(in_channels=1,
                       out_channels=8,
                       kernel_size=(3, 3),
                       stride=(2, 2),
@@ -174,10 +179,10 @@ class ActorCritic(nn.Module):
 
     def forward(self, x_1, x_2):
         x_1 = self.shared_conv(x_1)
-        # print(x_1.shape)
         x_1 = torch.flatten(x_1,
                             1)
         # print(x_1.shape)
+        # print(x_2.shape)
         x = torch.cat((x_1, x_2),
                        dim=1)
         # print(x.shape)
@@ -241,7 +246,10 @@ class A3CWorker(mp.Process):
 
         super(A3CWorker, self).__init__()
 
-        self.env = gym.make(ENV_NAME)
+        self.env = MAS_env(grid_size=32,
+                           obs_size=5,
+                           num_agents=8,
+                           num_targets=12)
         self.local_model = ActorCritic().to(DEVICE).to(DTYPE)
         self.local_optimizer = torch.optim.Adam(self.local_model.parameters(),
                                                 lr=LR_WORKER)
@@ -261,13 +269,17 @@ class A3CWorker(mp.Process):
         for _ in tqdm(range(MAX_EPISODES)):
             self.synchronize_models()
 
-            state_1, state_2, _ = self.env.reset()
+            state_1, state_2 = self.env.reset()
+            # print(state_1.shape)
+            # print(state_2.shape)
             state_1 = torch.tensor(state_1,
                                    dtype=DTYPE,
-                                   device=DEVICE)
+                                   device=DEVICE).unsqueeze(1)
             state_2 = torch.tensor(state_2,
                                    dtype=DTYPE,
                                    device=DEVICE)
+            # print(state_1.shape)
+            # print(state_2.shape)
             
             episode_reward = 0
             episode_loss = 0
@@ -281,7 +293,7 @@ class A3CWorker(mp.Process):
                 policy_distribution = torch.distributions.Categorical(policy)
                 action = policy_distribution.sample()
 
-                next_state_1, next_state_2, reward, terminated, truncated, _ = self.env.step(action.item())
+                next_state_1, next_state_2, reward, terminated, truncated, _ = self.env.step(action.detach().numpy())
 
                 self.global_step_counter.value += 1
 
@@ -289,20 +301,22 @@ class A3CWorker(mp.Process):
 
                 next_state_1 = torch.tensor(next_state_1,
                                             dtype=DTYPE,
-                                            device=DEVICE)
+                                            device=DEVICE).unsqueeze(1)
                 next_state_2 = torch.tensor(next_state_2,
                                             dtype=DTYPE,
                                             device=DEVICE)
 
-                episode_reward = episode_reward + reward
+                episode_reward = episode_reward + reward.sum()
 
                 reward *= REWARD_SCALING
+                print(f"Reward: {reward.shape}")
+                print(f"Value: {value_current_state.shape}")
 
                 if done:
                     reward += TERMINATION_REWARD
                 reward = torch.tensor(reward,
                                       dtype=DTYPE,
-                                      device=DEVICE)
+                                      device=DEVICE).unsqueeze(1)
 
                 self.replay_buffer.push(policy_distribution,
                                         action,
@@ -343,10 +357,11 @@ class A3CWorker(mp.Process):
             R = 0
         else:
             _, value_next_state = self.local_model.forward(next_state_1, next_state_2)
-            R = value_next_state
+            R = value_next_state.detach()
         
         for t in reversed(range(self.step_counter - start_step)):
             R *= DISCOUNT_FACTOR
+            print(f"Reward memory: {memory.reward[t].shape}")
             R += memory.reward[t]
 
             advantage = R - memory.value_current_state[t]
